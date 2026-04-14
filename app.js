@@ -38,7 +38,7 @@ app.use("/api/devices/printers", printerRoutes);
 
 // Health check
 app.get("/health", (req, res) => {
-  res.json({ status: "OK", timestamp: new Date().toISOString() });
+  res.json({ status: "OK!!", timestamp: new Date().toISOString() });
 });
 
 // Error handling
