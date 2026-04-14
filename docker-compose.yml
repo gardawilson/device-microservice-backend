@@ -1,0 +1,35 @@
+services:
+  mongodb:
+    image: mongo:7
+    container_name: device-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: device-service
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - device-network
+
+  app:
+    build: .
+    container_name: device-service
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      NODE_ENV: production
+      MONGODB_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@mongodb:27017/device-service?authSource=admin
+    depends_on:
+      - mongodb
+    networks:
+      - device-network
+
+volumes:
+  mongo_data:
+
+networks:
+  device-network:
+    driver: bridge
