@@ -57,6 +57,7 @@ export const getAllPrinters = async (req, res) => {
           name: p.name ?? null,
           printUsage: `${printsSinceMaintenance}/${maxPrintCount}`,
           lastUsedAt: p.lastUsedAt,
+          lastUsedBy: p.lastUsedBy ?? null,
           status: p.status,
         };
       }),
@@ -160,6 +161,7 @@ export const getPrinterById = async (req, res) => {
       name: device.name ?? null,
       printUsage: `${printsSinceMaintenance}/${maxPrintCount}`,
       lastUsedAt: device.lastUsedAt,
+      lastUsedBy: device.lastUsedBy ?? null,
       status: device.status,
     });
   } catch (error) {
@@ -251,7 +253,6 @@ export const getPrinterLogs = async (req, res) => {
       total,
       page: currentPage,
       limit: currentLimit,
-      sourceAppSummary,
     } = await printerService.getLogs(normalizeIdentifier(resolvedIdentifier), {
       page: parsedPage,
       limit: parsedLimit,
@@ -269,7 +270,6 @@ export const getPrinterLogs = async (req, res) => {
         total,
         totalPages: Math.ceil(total / currentLimit),
       },
-      sourceAppSummary,
       logs: logs.map((l) => ({
         id: l._id,
         sourceApp: l.sourceApp,
@@ -283,6 +283,57 @@ export const getPrinterLogs = async (req, res) => {
       return res.status(404).json({ error: "Printer not found" });
     }
     console.error("Error getting printer logs:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+export const getPrinterLogSummary = async (req, res) => {
+  try {
+    const { identifier, printerId, mac, from, to } = req.query;
+    const resolvedIdentifier = identifier ?? printerId ?? mac;
+
+    if (!resolvedIdentifier || typeof resolvedIdentifier !== "string") {
+      return res.status(400).json({ error: "Invalid identifier" });
+    }
+    if (from != null && typeof from !== "string") {
+      return res.status(400).json({ error: "Invalid from date" });
+    }
+    if (to != null && typeof to !== "string") {
+      return res.status(400).json({ error: "Invalid to date" });
+    }
+
+    const summary = await printerService.getLogSummary(
+      normalizeIdentifier(resolvedIdentifier),
+      {
+        from,
+        to,
+      },
+    );
+
+    res.json({
+      printer: {
+        id: summary.printer._id,
+        identifier: summary.printer.identifier,
+        name: summary.printer.name ?? null,
+      },
+      range: summary.range,
+      scope: summary.scope,
+      totalPrintCount: summary.totalPrintCount,
+      totalLogEntries: summary.totalLogEntries,
+      sourceAppSummary: summary.sourceAppSummary,
+      dailySummary: summary.dailySummary,
+    });
+  } catch (error) {
+    if (error.message === "Printer not found") {
+      return res.status(404).json({ error: "Printer not found" });
+    }
+    if (error.message === "Invalid date range") {
+      return res.status(400).json({
+        error: "Invalid date range",
+        message: "from must be less than or equal to to and must be in YYYY-MM-DD format",
+      });
+    }
+    console.error("Error getting printer log summary:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 };

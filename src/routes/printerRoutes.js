@@ -6,6 +6,7 @@ import {
   getPrinterById,
   logPrinterUsage,
   getPrinterLogs,
+  getPrinterLogSummary,
   getResetLogs,
   updatePrinterName,
   performPrinterReset,
@@ -114,7 +115,104 @@ router.get("/", getAllPrinters);
  *         description: Internal server error
  */
 router.post("/log", logPrinterUsage);
+
+/**
+ * @swagger
+ * /api/devices/printers/log:
+ *   get:
+ *     summary: Get printer usage logs
+ *     tags: [Printers]
+ *     parameters:
+ *       - in: query
+ *         name: identifier
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: MAC address or unique ID of the printer
+ *       - in: query
+ *         name: printerId
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: Alias for identifier
+ *       - in: query
+ *         name: mac
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: Alias for identifier
+ *       - in: query
+ *         name: page
+ *         schema:
+ *           type: integer
+ *           default: 1
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           default: 20
+ *     responses:
+ *       200:
+ *         description: Printer logs
+ *       400:
+ *         description: Invalid input
+ *       404:
+ *         description: Printer not found
+ *       500:
+ *         description: Internal server error
+ */
 router.get("/log", getPrinterLogs);
+
+/**
+ * @swagger
+ * /api/devices/printers/log/summary:
+ *   get:
+ *     summary: Get printer usage summary by date range
+ *     tags: [Printers]
+ *     parameters:
+ *       - in: query
+ *         name: identifier
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: MAC address or unique ID of the printer
+ *       - in: query
+ *         name: printerId
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: Alias for identifier
+ *       - in: query
+ *         name: mac
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: Alias for identifier
+ *       - in: query
+ *         name: from
+ *         required: false
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Start date in YYYY-MM-DD
+ *       - in: query
+ *         name: to
+ *         required: false
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: End date in YYYY-MM-DD
+ *     responses:
+ *       200:
+ *         description: Printer summary by date range
+ *       400:
+ *         description: Invalid input
+ *       404:
+ *         description: Printer not found
+ *       500:
+ *         description: Internal server error
+ */
+router.get("/log/summary", getPrinterLogSummary);
 
 /**
  * @swagger

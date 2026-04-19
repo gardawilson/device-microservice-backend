@@ -28,6 +28,11 @@ const deviceSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
     },
+    lastUsedBy: {
+      type: String,
+      default: null,
+      trim: true,
+    },
     status: {
       type: String,
       enum: ["NORMAL", "WARNING", "CRITICAL"],
