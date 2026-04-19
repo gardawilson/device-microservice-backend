@@ -99,6 +99,41 @@ class PrinterService {
     return setting;
   }
 
+  async recalculatePrinterStatuses(maxPrintCount) {
+    const printers = await Device.find({ deviceType: "PRINTER" }).select(
+      "_id totalPrint lastMaintenancePrint",
+    );
+
+    if (!printers.length) {
+      return { matchedCount: 0, modifiedCount: 0 };
+    }
+
+    const ops = printers.map((printer) => {
+      const printsSinceMaintenance =
+        printer.totalPrint - printer.lastMaintenancePrint;
+      let status = "NORMAL";
+
+      if (printsSinceMaintenance >= maxPrintCount) {
+        status = "CRITICAL";
+      } else if (printsSinceMaintenance >= maxPrintCount * 0.8) {
+        status = "WARNING";
+      }
+
+      return {
+        updateOne: {
+          filter: { _id: printer._id },
+          update: { $set: { status } },
+        },
+      };
+    });
+
+    const result = await Device.bulkWrite(ops, { ordered: false });
+    return {
+      matchedCount: result.matchedCount ?? printers.length,
+      modifiedCount: result.modifiedCount ?? 0,
+    };
+  }
+
   async getAllPrinters() {
     const [printers, maxPrintCount] = await Promise.all([
       Device.find({ deviceType: "PRINTER" }).select(

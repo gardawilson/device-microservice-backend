@@ -91,7 +91,16 @@ export const setMaxPrintCount = async (req, res) => {
     }
 
     const setting = await printerService.setMaxPrintCount(maxPrintCount);
-    res.json({ maxPrintCount: setting.value });
+    const recheckResult = await printerService.recalculatePrinterStatuses(
+      setting.value,
+    );
+    res.json({
+      maxPrintCount: setting.value,
+      recheck: {
+        matchedCount: recheckResult.matchedCount,
+        modifiedCount: recheckResult.modifiedCount,
+      },
+    });
   } catch (error) {
     console.error("Error setting max print count:", error);
     res.status(500).json({ error: "Internal server error" });
