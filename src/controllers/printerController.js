@@ -2,29 +2,101 @@ import mongoose from "mongoose";
 import printerService from "../services/printerService.js";
 
 const MAC_ADDRESS_REGEX = /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/i;
+const IPV4_REGEX =
+  /^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
 const normalizeIdentifier = (value) => value.trim().toUpperCase();
 const isValidObjectId = (value) => mongoose.Types.ObjectId.isValid(value);
 
+const toNumber = (value, fallback) => {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const serializePrinter = (p, maxPrintCount) => {
+  const printsSinceMaintenance =
+    (p.totalPrint ?? 0) - (p.lastMaintenancePrint ?? 0);
+  const isNetwork = p.connectionType === "NETWORK";
+  const st = isNetwork ? printerService.getNetworkStatus(p._id) : null;
+  return {
+    id: p._id,
+    identifier: p.identifier,
+    name: p.name ?? null,
+    connectionType: p.connectionType ?? "BLUETOOTH",
+    network:
+      isNetwork && p.network
+        ? {
+            ipAddress: p.network.ipAddress ?? p.identifier,
+            port: p.network.port ?? 9100,
+            labelWidthMm: p.network.labelWidthMm ?? 100,
+            labelHeightMm: p.network.labelHeightMm ?? 150,
+          }
+        : null,
+    // Status ICMP untuk printer jaringan (null = belum pernah dicek poller).
+    online: isNetwork ? (st ? st.online : null) : null,
+    latencyMs: st?.latencyMs ?? null,
+    lastCheckedAt: st?.checkedAt ?? null,
+    printUsage: `${printsSinceMaintenance}/${maxPrintCount}`,
+    lastUsedAt: p.lastUsedAt,
+    lastUsedBy: p.lastUsedBy ?? null,
+    status: p.status,
+  };
+};
+
 export const createPrinter = async (req, res) => {
   try {
-    const { mac, name } = req.body;
+    const {
+      mac,
+      ipAddress,
+      name,
+      connectionType,
+      port,
+      labelWidthMm,
+      labelHeightMm,
+    } = req.body;
 
-    // Simple validation
-    if (!mac || typeof mac !== "string") {
-      return res.status(400).json({ error: "Invalid mac" });
-    }
-    if (!MAC_ADDRESS_REGEX.test(mac.trim())) {
-      return res.status(400).json({ error: "Invalid mac format" });
-    }
-    if (!name || typeof name !== "string") {
+    if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "Invalid name" });
     }
 
-    const normalizedMac = mac.trim().toUpperCase();
-    const device = await printerService.createPrinter(
-      normalizedMac,
-      name.trim(),
-    );
+    const type = (
+      connectionType || (ipAddress ? "NETWORK" : "BLUETOOTH")
+    ).toUpperCase();
+
+    let device;
+    if (type === "NETWORK") {
+      if (!ipAddress || typeof ipAddress !== "string") {
+        return res.status(400).json({ error: "Invalid ipAddress" });
+      }
+      const ip = ipAddress.trim();
+      if (!IPV4_REGEX.test(ip)) {
+        return res.status(400).json({ error: "Invalid ipAddress format" });
+      }
+      device = await printerService.createPrinter({
+        identifier: ip,
+        name: name.trim(),
+        connectionType: "NETWORK",
+        network: {
+          ipAddress: ip,
+          port: toNumber(port, 9100),
+          labelWidthMm: toNumber(labelWidthMm, 100),
+          labelHeightMm: toNumber(labelHeightMm, 150),
+        },
+      });
+      printerService.refreshNetworkStatusSoon();
+    } else {
+      if (!mac || typeof mac !== "string") {
+        return res.status(400).json({ error: "Invalid mac" });
+      }
+      if (!MAC_ADDRESS_REGEX.test(mac.trim())) {
+        return res.status(400).json({ error: "Invalid mac format" });
+      }
+      device = await printerService.createPrinter({
+        identifier: mac.trim().toUpperCase(),
+        name: name.trim(),
+        connectionType: "BLUETOOTH",
+      });
+    }
+
     res.status(201).json({
       message: "Printer created successfully",
       device: {
@@ -32,6 +104,8 @@ export const createPrinter = async (req, res) => {
         identifier: device.identifier,
         name: device.name,
         deviceType: device.deviceType,
+        connectionType: device.connectionType,
+        network: device.network ?? null,
         status: device.status,
       },
     });
@@ -49,18 +123,7 @@ export const getAllPrinters = async (req, res) => {
     const { printers, maxPrintCount } = await printerService.getAllPrinters();
     res.json({
       maxPrintCount,
-      printers: printers.map((p) => {
-        const printsSinceMaintenance = p.totalPrint - p.lastMaintenancePrint;
-        return {
-          id: p._id,
-          identifier: p.identifier,
-          name: p.name ?? null,
-          printUsage: `${printsSinceMaintenance}/${maxPrintCount}`,
-          lastUsedAt: p.lastUsedAt,
-          lastUsedBy: p.lastUsedBy ?? null,
-          status: p.status,
-        };
-      }),
+      printers: printers.map((p) => serializePrinter(p, maxPrintCount)),
     });
   } catch (error) {
     console.error("Error getting all printers:", error);
@@ -161,18 +224,7 @@ export const getPrinterById = async (req, res) => {
     }
 
     const { device, maxPrintCount } = await printerService.getPrinterById(id);
-    const printsSinceMaintenance =
-      device.totalPrint - device.lastMaintenancePrint;
-
-    res.json({
-      id: device._id,
-      identifier: device.identifier,
-      name: device.name ?? null,
-      printUsage: `${printsSinceMaintenance}/${maxPrintCount}`,
-      lastUsedAt: device.lastUsedAt,
-      lastUsedBy: device.lastUsedBy ?? null,
-      status: device.status,
-    });
+    res.json(serializePrinter(device, maxPrintCount));
   } catch (error) {
     if (error.message === "Printer not found") {
       return res.status(404).json({ error: "Printer not found" });
@@ -185,30 +237,104 @@ export const getPrinterById = async (req, res) => {
 export const updatePrinterName = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name } = req.body;
+    const { name, ipAddress, port, labelWidthMm, labelHeightMm } = req.body;
 
     if (!id || typeof id !== "string" || !isValidObjectId(id)) {
       return res.status(400).json({ error: "Invalid id" });
     }
-    if (!name || typeof name !== "string") {
-      return res.status(400).json({ error: "Invalid name" });
+
+    const hasNetwork =
+      ipAddress !== undefined ||
+      port !== undefined ||
+      labelWidthMm !== undefined ||
+      labelHeightMm !== undefined;
+
+    if ((!name || typeof name !== "string" || !name.trim()) && !hasNetwork) {
+      return res.status(400).json({ error: "Nothing to update" });
+    }
+    if (ipAddress !== undefined && !IPV4_REGEX.test(String(ipAddress).trim())) {
+      return res.status(400).json({ error: "Invalid ipAddress format" });
     }
 
-    const device = await printerService.updatePrinterName(id, name.trim());
+    const device = await printerService.updatePrinter(id, {
+      name: typeof name === "string" ? name : undefined,
+      network: hasNetwork
+        ? {
+            ipAddress:
+              ipAddress !== undefined ? String(ipAddress).trim() : undefined,
+            port: port !== undefined ? toNumber(port, undefined) : undefined,
+            labelWidthMm:
+              labelWidthMm !== undefined
+                ? toNumber(labelWidthMm, undefined)
+                : undefined,
+            labelHeightMm:
+              labelHeightMm !== undefined
+                ? toNumber(labelHeightMm, undefined)
+                : undefined,
+          }
+        : undefined,
+    });
+
+    if (device.connectionType === "NETWORK") {
+      printerService.refreshNetworkStatusSoon();
+    }
 
     res.json({
-      message: "Printer name updated successfully",
+      message: "Printer updated successfully",
       device: {
         id: device._id,
         identifier: device.identifier,
         name: device.name,
+        connectionType: device.connectionType,
+        network: device.network ?? null,
       },
     });
   } catch (error) {
     if (error.message === "Printer not found") {
       return res.status(404).json({ error: "Printer not found" });
     }
-    console.error("Error updating printer name:", error);
+    console.error("Error updating printer:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+export const pingPrinter = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id || typeof id !== "string" || !isValidObjectId(id)) {
+      return res.status(400).json({ error: "Invalid id" });
+    }
+    const result = await printerService.pingPrinter(id);
+    res.json(result);
+  } catch (error) {
+    if (error.message === "Printer not found") {
+      return res.status(404).json({ error: "Printer not found" });
+    }
+    console.error("Error pinging printer:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+export const pingNetworkAdhoc = async (req, res) => {
+  try {
+    const target = String(req.body.ipAddress ?? req.body.host ?? "").trim();
+    if (!IPV4_REGEX.test(target)) {
+      return res.status(400).json({ error: "Invalid ipAddress" });
+    }
+    const result = await printerService.pingHostPort(target, req.body.port);
+    res.json(result);
+  } catch (error) {
+    console.error("Error pinging host:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+export const pingAllNetworkPrinters = async (req, res) => {
+  try {
+    const result = await printerService.pingAllNetwork();
+    res.json(result);
+  } catch (error) {
+    console.error("Error pinging network printers:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 };

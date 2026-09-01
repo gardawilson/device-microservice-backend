@@ -12,6 +12,9 @@ import {
   performPrinterReset,
   getMaxPrintCount,
   setMaxPrintCount,
+  pingPrinter,
+  pingNetworkAdhoc,
+  pingAllNetworkPrinters,
 } from "../controllers/printerController.js";
 
 const router = express.Router();
@@ -291,8 +294,16 @@ router.post("/reset", performPrinterReset);
 router.get("/settings/max-print-count", getMaxPrintCount);
 router.put("/settings/max-print-count", setMaxPrintCount);
 
+// ── Ping / status printer jaringan (TCP probe ke port 9100) ──────────────────
+// GET  /api/devices/printers/network/status  → cek semua printer NETWORK
+// POST /api/devices/printers/ping            → cek ad-hoc { ipAddress, port }
+// GET  /api/devices/printers/:id/ping        → cek satu printer terdaftar
+router.get("/network/status", pingAllNetworkPrinters);
+router.post("/ping", pingNetworkAdhoc);
+
 // Keep param route at the end so it does not shadow static routes like /log
 router.get("/:id", getPrinterById);
+router.get("/:id/ping", pingPrinter);
 router.patch("/:id", updatePrinterName);
 router.delete("/:id", deletePrinter);
 

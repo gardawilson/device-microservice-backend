@@ -1,9 +1,78 @@
+import { execFile } from "child_process";
+
 import Device from "../models/Device.js";
 import DeviceLog from "../models/DeviceLog.js";
 import DeviceMaintenance from "../models/DeviceMaintenance.js";
 import DeviceSetting from "../models/DeviceSetting.js";
 
 const DEFAULT_MAX_PRINT_COUNT = 1000;
+const STATUS_POLL_INTERVAL_MS = 30_000;
+const IS_WINDOWS = process.platform === "win32";
+
+// (1) Kirim beberapa paket ICMP per pengecekan; online kalau minimal 1 balas.
+//     Ini menyerap RTO/packet-loss sesaat tanpa nunggu siklus berikutnya.
+const PING_PACKETS = 3;
+const PING_PER_REPLY_MS = 1000;
+
+// (2) Hysteresis: baru dianggap offline setelah gagal beberapa siklus berturut.
+//     Sukses langsung balik online.
+const OFFLINE_FAIL_THRESHOLD = 3;
+
+/// ICMP ping ke IP printer (spawn `ping` OS, tanpa raw socket).
+/// Mengirim [PING_PACKETS] paket. Return { online, latencyMs }.
+const icmpPing = (host) =>
+  new Promise((resolve) => {
+    const args = IS_WINDOWS
+      ? ["-n", String(PING_PACKETS), "-w", String(PING_PER_REPLY_MS), host]
+      : [
+          "-c",
+          String(PING_PACKETS),
+          "-W",
+          String(Math.max(1, Math.ceil(PING_PER_REPLY_MS / 1000))),
+          host,
+        ];
+
+    // beri ruang: (paket × timeout per-reply) + overhead
+    const hardTimeoutMs = PING_PACKETS * PING_PER_REPLY_MS + 3000;
+
+    execFile(
+      "ping",
+      args,
+      { timeout: hardTimeoutMs, windowsHide: true },
+      (err, stdout = "") => {
+        // exit code 0 = ada minimal 1 balasan
+        const online = !err;
+        let latencyMs = null;
+        const m = /time[=<]\s*([\d.]+)\s*ms/i.exec(stdout);
+        if (online && m) latencyMs = Math.round(parseFloat(m[1]));
+        resolve({ online, latencyMs });
+      },
+    );
+  });
+
+/// Cache status per printerId: { online, latencyMs, checkedAt, failCount }.
+const statusCache = new Map();
+
+/// Gabungkan hasil probe baru dengan status sebelumnya menerapkan hysteresis:
+///  - sukses  → online:true, failCount:0
+///  - gagal   → failCount++; tetap pakai status lama sampai failCount mencapai
+///              [OFFLINE_FAIL_THRESHOLD], baru online:false. Kalau belum pernah
+///              sukses, status = null (belum pasti) sampai ambang tercapai.
+const mergeStatus = (prev, probe, checkedAt) => {
+  if (probe.online) {
+    return { online: true, latencyMs: probe.latencyMs, checkedAt, failCount: 0 };
+  }
+  const failCount = (prev?.failCount ?? 0) + 1;
+  const online =
+    failCount >= OFFLINE_FAIL_THRESHOLD ? false : (prev?.online ?? null);
+  return {
+    online,
+    latencyMs: online === true ? (prev?.latencyMs ?? null) : null,
+    checkedAt,
+    failCount,
+  };
+};
+
 const REPORT_TIME_ZONE = "Asia/Jakarta";
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -68,11 +137,19 @@ const buildDateRange = ({ from, to, fallbackStart } = {}) => {
   };
 };
 
+const PRINTER_FIELDS =
+  "identifier name connectionType network totalPrint lastMaintenancePrint lastUsedAt lastUsedBy status";
+
 class PrinterService {
-  async createPrinter(mac, name) {
+  async createPrinter({
+    identifier,
+    name,
+    connectionType = "BLUETOOTH",
+    network,
+  }) {
     // Check if already exists
     const existing = await Device.findOne({
-      identifier: mac,
+      identifier,
       deviceType: "PRINTER",
     });
     if (existing) {
@@ -81,8 +158,10 @@ class PrinterService {
 
     const device = new Device({
       deviceType: "PRINTER",
-      identifier: mac,
+      connectionType,
+      identifier,
       name,
+      network: connectionType === "NETWORK" ? network : undefined,
       totalPrint: 0,
       lastMaintenancePrint: 0,
       lastUsedAt: new Date(),
@@ -144,9 +223,7 @@ class PrinterService {
 
   async getAllPrinters() {
     const [printers, maxPrintCount] = await Promise.all([
-      Device.find({ deviceType: "PRINTER" }).select(
-        "identifier name totalPrint lastMaintenancePrint lastUsedAt lastUsedBy status",
-      ),
+      Device.find({ deviceType: "PRINTER" }).select(PRINTER_FIELDS),
       this.getMaxPrintCount(),
     ]);
     return { printers, maxPrintCount };
@@ -163,7 +240,7 @@ class PrinterService {
     return { device, maxPrintCount };
   }
 
-  async updatePrinterName(id, name) {
+  async updatePrinter(id, { name, network } = {}) {
     const device = await Device.findOne({
       _id: id,
       deviceType: "PRINTER",
@@ -172,10 +249,129 @@ class PrinterService {
       throw new Error("Printer not found");
     }
 
-    device.name = name;
-    await device.save();
+    if (typeof name === "string" && name.trim()) {
+      device.name = name.trim();
+    }
 
+    if (network && device.connectionType === "NETWORK") {
+      device.network = {
+        ipAddress: network.ipAddress ?? device.network?.ipAddress,
+        port: network.port ?? device.network?.port ?? 9100,
+        labelWidthMm:
+          network.labelWidthMm ?? device.network?.labelWidthMm ?? 100,
+        labelHeightMm:
+          network.labelHeightMm ?? device.network?.labelHeightMm ?? 150,
+      };
+      // identifier mengikuti IP untuk printer jaringan
+      if (network.ipAddress) device.identifier = network.ipAddress;
+    }
+
+    await device.save();
     return device;
+  }
+
+  // Kompat lama
+  async updatePrinterName(id, name) {
+    return this.updatePrinter(id, { name });
+  }
+
+  // ==========================================
+  //  PING / STATUS PRINTER JARINGAN (ICMP)
+  //  Poller latar belakang ping IP tiap printer NETWORK secara berkala; hasil
+  //  di-cache dan disisipkan ke response daftar printer sebagai `online`.
+  // ==========================================
+
+  /// Status ICMP terakhir untuk sebuah printerId, atau null kalau belum pernah
+  /// dicek. Bentuk: { online, latencyMs, checkedAt }.
+  getNetworkStatus(id) {
+    return statusCache.get(String(id)) || null;
+  }
+
+  /// Ping ad-hoc ke host (tanpa perlu terdaftar) — dipakai form admin.
+  /// Sekali cek (tanpa hysteresis) karena belum ada riwayat.
+  async pingHostPort(host) {
+    const result = await icmpPing(host);
+    return { ipAddress: host, ...result, checkedAt: new Date() };
+  }
+
+  /// Ping satu printer terdaftar + update cache (dengan hysteresis).
+  async pingPrinter(id) {
+    const device = await Device.findOne({ _id: id, deviceType: "PRINTER" });
+    if (!device) {
+      throw new Error("Printer not found");
+    }
+    const host = device.network?.ipAddress || device.identifier;
+    const key = String(device._id);
+    const probe = await icmpPing(host);
+    const entry = mergeStatus(statusCache.get(key), probe, new Date());
+    statusCache.set(key, entry);
+    return {
+      id: device._id,
+      name: device.name,
+      connectionType: device.connectionType,
+      ipAddress: host,
+      online: entry.online,
+      latencyMs: entry.latencyMs,
+      checkedAt: entry.checkedAt,
+      failCount: entry.failCount,
+    };
+  }
+
+  /// Ping semua printer NETWORK sekaligus + refresh seluruh cache (hysteresis).
+  async pingAllNetwork() {
+    const devices = await Device.find({
+      deviceType: "PRINTER",
+      connectionType: "NETWORK",
+    }).select("identifier name network");
+
+    const checkedAt = new Date();
+    const printers = await Promise.all(
+      devices.map(async (d) => {
+        const host = d.network?.ipAddress || d.identifier;
+        const key = String(d._id);
+        const probe = await icmpPing(host);
+        const entry = mergeStatus(statusCache.get(key), probe, checkedAt);
+        statusCache.set(key, entry);
+        return {
+          id: d._id,
+          name: d.name,
+          ipAddress: host,
+          online: entry.online,
+          latencyMs: entry.latencyMs,
+          failCount: entry.failCount,
+        };
+      }),
+    );
+
+    // Buang entri cache untuk printer yang sudah dihapus.
+    const alive = new Set(devices.map((d) => String(d._id)));
+    for (const key of statusCache.keys()) {
+      if (!alive.has(key)) statusCache.delete(key);
+    }
+
+    return { checkedAt, printers };
+  }
+
+  /// Refresh cache tanpa menunggu (fire-and-forget) — dipanggil setelah
+  /// printer NETWORK dibuat/diubah.
+  refreshNetworkStatusSoon() {
+    this.pingAllNetwork().catch((e) =>
+      console.error("refreshNetworkStatusSoon failed:", e.message),
+    );
+  }
+
+  /// Mulai poller latar belakang. Dipanggil sekali saat server boot.
+  startStatusMonitor() {
+    this.pingAllNetwork().catch((e) =>
+      console.error("Initial printer status poll failed:", e.message),
+    );
+    const timer = setInterval(() => {
+      this.pingAllNetwork().catch((e) =>
+        console.error("Printer status poll failed:", e.message),
+      );
+    }, STATUS_POLL_INTERVAL_MS);
+    timer.unref?.();
+    return timer;
   }
 
   async deletePrinter(id) {

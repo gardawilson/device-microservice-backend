@@ -1,5 +1,17 @@
 import mongoose from "mongoose";
 
+/// Parameter khusus printer jaringan (TCP RAW / TSPL). Hanya diisi saat
+/// connectionType === "NETWORK".
+const networkSchema = new mongoose.Schema(
+  {
+    ipAddress: { type: String, trim: true },
+    port: { type: Number, default: 9100 },
+    labelWidthMm: { type: Number, default: 100 },
+    labelHeightMm: { type: Number, default: 150 },
+  },
+  { _id: false },
+);
+
 const deviceSchema = new mongoose.Schema(
   {
     deviceType: {
@@ -7,14 +19,23 @@ const deviceSchema = new mongoose.Schema(
       required: true,
       enum: ["PRINTER"], // Can be extended for other devices
     },
+    connectionType: {
+      type: String,
+      enum: ["BLUETOOTH", "NETWORK"],
+      default: "BLUETOOTH",
+    },
     identifier: {
       type: String,
       required: true,
-      unique: true, // MAC address or unique ID
+      unique: true, // MAC address (BLUETOOTH) atau IP address (NETWORK)
     },
     name: {
       type: String,
       required: true, // Human-readable alias for monitoring
+    },
+    network: {
+      type: networkSchema,
+      default: undefined,
     },
     totalPrint: {
       type: Number,
