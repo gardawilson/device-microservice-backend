@@ -31,9 +31,11 @@ const serializePrinter = (p, maxPrintCount) => {
             labelHeightMm: p.network.labelHeightMm ?? 150,
           }
         : null,
-    // Status ICMP untuk printer jaringan (null = belum pernah dicek poller).
+    // Status printer jaringan (null = belum pernah dicek poller).
+    // via: "icmp" (ping balas) atau "tcp" (port cetak terbuka).
     online: isNetwork ? (st ? st.online : null) : null,
     latencyMs: st?.latencyMs ?? null,
+    onlineVia: st?.via ?? null,
     lastCheckedAt: st?.checkedAt ?? null,
     printUsage: `${printsSinceMaintenance}/${maxPrintCount}`,
     lastUsedAt: p.lastUsedAt,

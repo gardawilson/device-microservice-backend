@@ -1,4 +1,5 @@
 import { execFile } from "child_process";
+import net from "net";
 
 import Device from "../models/Device.js";
 import DeviceLog from "../models/DeviceLog.js";
@@ -18,8 +19,14 @@ const PING_PER_REPLY_MS = 1000;
 //     Sukses langsung balik online.
 const OFFLINE_FAIL_THRESHOLD = 3;
 
+const TCP_TIMEOUT_MS = 2000;
+const DEFAULT_PRINT_PORT = 9100;
+
 /// ICMP ping ke IP printer (spawn `ping` OS, tanpa raw socket).
-/// Mengirim [PING_PACKETS] paket. Return { online, latencyMs }.
+/// Mengirim [PING_PACKETS] paket. Return { ok, latencyMs }.
+/// Catatan: di dalam container Docker, binary `ping` sering tidak ada atau
+/// ICMP diblok (butuh CAP_NET_RAW) → fungsi ini akan selalu { ok:false }.
+/// Itu sebabnya [probe] jatuh ke TCP.
 const icmpPing = (host) =>
   new Promise((resolve) => {
     const args = IS_WINDOWS
@@ -32,7 +39,6 @@ const icmpPing = (host) =>
           host,
         ];
 
-    // beri ruang: (paket × timeout per-reply) + overhead
     const hardTimeoutMs = PING_PACKETS * PING_PER_REPLY_MS + 3000;
 
     execFile(
@@ -40,15 +46,46 @@ const icmpPing = (host) =>
       args,
       { timeout: hardTimeoutMs, windowsHide: true },
       (err, stdout = "") => {
-        // exit code 0 = ada minimal 1 balasan
-        const online = !err;
+        const ok = !err;
         let latencyMs = null;
         const m = /time[=<]\s*([\d.]+)\s*ms/i.exec(stdout);
-        if (online && m) latencyMs = Math.round(parseFloat(m[1]));
-        resolve({ online, latencyMs });
+        if (ok && m) latencyMs = Math.round(parseFloat(m[1]));
+        resolve({ ok, latencyMs });
       },
     );
   });
+
+/// TCP connect ke port cetak (RAW/JetDirect). Selalu jalan di container,
+/// tanpa binary/privilege. Return { ok, latencyMs }.
+const tcpProbe = (host, port = DEFAULT_PRINT_PORT, timeoutMs = TCP_TIMEOUT_MS) =>
+  new Promise((resolve) => {
+    const start = Date.now();
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ ok, latencyMs: ok ? Date.now() - start : null });
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+    socket.connect(Number(port) || DEFAULT_PRINT_PORT, host);
+  });
+
+/// Pengecekan status gabungan: online kalau ICMP balas ATAU port cetak
+/// bisa di-connect. `via` menandai metode yang berhasil.
+const probe = async (host, port) => {
+  const [icmp, tcp] = await Promise.all([icmpPing(host), tcpProbe(host, port)]);
+  const online = icmp.ok || tcp.ok;
+  return {
+    online,
+    latencyMs: icmp.ok ? icmp.latencyMs : tcp.ok ? tcp.latencyMs : null,
+    via: icmp.ok ? "icmp" : tcp.ok ? "tcp" : null,
+  };
+};
 
 /// Cache status per printerId: { online, latencyMs, checkedAt, failCount }.
 const statusCache = new Map();
@@ -58,9 +95,15 @@ const statusCache = new Map();
 ///  - gagal   → failCount++; tetap pakai status lama sampai failCount mencapai
 ///              [OFFLINE_FAIL_THRESHOLD], baru online:false. Kalau belum pernah
 ///              sukses, status = null (belum pasti) sampai ambang tercapai.
-const mergeStatus = (prev, probe, checkedAt) => {
-  if (probe.online) {
-    return { online: true, latencyMs: probe.latencyMs, checkedAt, failCount: 0 };
+const mergeStatus = (prev, result, checkedAt) => {
+  if (result.online) {
+    return {
+      online: true,
+      latencyMs: result.latencyMs,
+      via: result.via,
+      checkedAt,
+      failCount: 0,
+    };
   }
   const failCount = (prev?.failCount ?? 0) + 1;
   const online =
@@ -68,6 +111,7 @@ const mergeStatus = (prev, probe, checkedAt) => {
   return {
     online,
     latencyMs: online === true ? (prev?.latencyMs ?? null) : null,
+    via: online === true ? (prev?.via ?? null) : null,
     checkedAt,
     failCount,
   };
@@ -276,34 +320,35 @@ class PrinterService {
   }
 
   // ==========================================
-  //  PING / STATUS PRINTER JARINGAN (ICMP)
-  //  Poller latar belakang ping IP tiap printer NETWORK secara berkala; hasil
-  //  di-cache dan disisipkan ke response daftar printer sebagai `online`.
+  //  PING / STATUS PRINTER JARINGAN
+  //  Poller latar belakang cek tiap printer NETWORK: ICMP ping ATAU TCP connect
+  //  ke port cetak. Hasil di-cache & disisipkan ke response daftar printer.
   // ==========================================
 
-  /// Status ICMP terakhir untuk sebuah printerId, atau null kalau belum pernah
-  /// dicek. Bentuk: { online, latencyMs, checkedAt }.
+  /// Status terakhir untuk sebuah printerId, atau null kalau belum pernah dicek.
+  /// Bentuk: { online, latencyMs, via, checkedAt, failCount }.
   getNetworkStatus(id) {
     return statusCache.get(String(id)) || null;
   }
 
-  /// Ping ad-hoc ke host (tanpa perlu terdaftar) — dipakai form admin.
+  /// Cek ad-hoc ke host (tanpa perlu terdaftar) — dipakai form admin.
   /// Sekali cek (tanpa hysteresis) karena belum ada riwayat.
-  async pingHostPort(host) {
-    const result = await icmpPing(host);
+  async pingHostPort(host, port) {
+    const result = await probe(host, port);
     return { ipAddress: host, ...result, checkedAt: new Date() };
   }
 
-  /// Ping satu printer terdaftar + update cache (dengan hysteresis).
+  /// Cek satu printer terdaftar + update cache (dengan hysteresis).
   async pingPrinter(id) {
     const device = await Device.findOne({ _id: id, deviceType: "PRINTER" });
     if (!device) {
       throw new Error("Printer not found");
     }
     const host = device.network?.ipAddress || device.identifier;
+    const port = device.network?.port;
     const key = String(device._id);
-    const probe = await icmpPing(host);
-    const entry = mergeStatus(statusCache.get(key), probe, new Date());
+    const result = await probe(host, port);
+    const entry = mergeStatus(statusCache.get(key), result, new Date());
     statusCache.set(key, entry);
     return {
       id: device._id,
@@ -312,12 +357,13 @@ class PrinterService {
       ipAddress: host,
       online: entry.online,
       latencyMs: entry.latencyMs,
+      via: entry.via,
       checkedAt: entry.checkedAt,
       failCount: entry.failCount,
     };
   }
 
-  /// Ping semua printer NETWORK sekaligus + refresh seluruh cache (hysteresis).
+  /// Cek semua printer NETWORK sekaligus + refresh seluruh cache (hysteresis).
   async pingAllNetwork() {
     const devices = await Device.find({
       deviceType: "PRINTER",
@@ -329,8 +375,8 @@ class PrinterService {
       devices.map(async (d) => {
         const host = d.network?.ipAddress || d.identifier;
         const key = String(d._id);
-        const probe = await icmpPing(host);
-        const entry = mergeStatus(statusCache.get(key), probe, checkedAt);
+        const result = await probe(host, d.network?.port);
+        const entry = mergeStatus(statusCache.get(key), result, checkedAt);
         statusCache.set(key, entry);
         return {
           id: d._id,
@@ -338,6 +384,7 @@ class PrinterService {
           ipAddress: host,
           online: entry.online,
           latencyMs: entry.latencyMs,
+          via: entry.via,
           failCount: entry.failCount,
         };
       }),
