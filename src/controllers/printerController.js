@@ -341,6 +341,33 @@ export const pingAllNetworkPrinters = async (req, res) => {
   }
 };
 
+// POST /api/devices/printers/relay?ip=<ipv4>
+// Body: TSPL mentah (application/octet-stream). Route pakai express.raw →
+// req.body = Buffer. Teruskan ke printer NETWORK terdaftar via TCP.
+export const relayPrintJob = async (req, res) => {
+  try {
+    const ip = String(req.query.ip ?? "").trim();
+    if (!IPV4_REGEX.test(ip)) {
+      return res.status(400).json({ error: "Invalid ip" });
+    }
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      return res.status(400).json({ error: "Empty print payload" });
+    }
+
+    const result = await printerService.relayPrint(ip, req.body);
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    if (error.message === "Printer not found") {
+      return res.status(404).json({ error: "Printer not found" });
+    }
+    console.error("Error relaying print job:", error);
+    res.status(502).json({
+      error: "Gagal mengirim ke printer",
+      code: error.code || error.message,
+    });
+  }
+};
+
 export const deletePrinter = async (req, res) => {
   try {
     const { id } = req.params;

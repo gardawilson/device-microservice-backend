@@ -20,7 +20,13 @@ const PING_PER_REPLY_MS = 1000;
 const OFFLINE_FAIL_THRESHOLD = 3;
 
 const TCP_TIMEOUT_MS = 2000;
+const RELAY_TIMEOUT_MS = 20000; // job cetak raster besar bisa lambat
 const DEFAULT_PRINT_PORT = 9100;
+
+// Set PRINTER_STATUS_DEBUG=1 untuk log detail tiap probe di docker logs.
+const STATUS_DEBUG = process.env.PRINTER_STATUS_DEBUG === "1";
+const slog = (...a) => console.log("[printer-status]", ...a);
+const rlog = (...a) => console.log("[printer-relay]", ...a);
 
 /// ICMP ping ke IP printer (spawn `ping` OS, tanpa raw socket).
 /// Mengirim [PING_PACKETS] paket. Return { ok, latencyMs }.
@@ -45,45 +51,63 @@ const icmpPing = (host) =>
       "ping",
       args,
       { timeout: hardTimeoutMs, windowsHide: true },
-      (err, stdout = "") => {
+      (err, stdout = "", stderr = "") => {
         const ok = !err;
         let latencyMs = null;
         const m = /time[=<]\s*([\d.]+)\s*ms/i.exec(stdout);
         if (ok && m) latencyMs = Math.round(parseFloat(m[1]));
-        resolve({ ok, latencyMs });
+        const detail = ok
+          ? null
+          : err.code === "ENOENT"
+            ? "no-ping-binary"
+            : (err.code ||
+              (stderr || err.message || "").toString().trim().slice(0, 120) ||
+              "failed");
+        resolve({ ok, latencyMs, detail });
       },
     );
   });
 
 /// TCP connect ke port cetak (RAW/JetDirect). Selalu jalan di container,
-/// tanpa binary/privilege. Return { ok, latencyMs }.
+/// tanpa binary/privilege. Return { ok, latencyMs, detail }.
 const tcpProbe = (host, port = DEFAULT_PRINT_PORT, timeoutMs = TCP_TIMEOUT_MS) =>
   new Promise((resolve) => {
     const start = Date.now();
     const socket = new net.Socket();
     let settled = false;
-    const finish = (ok) => {
+    const finish = (ok, detail = null) => {
       if (settled) return;
       settled = true;
       socket.destroy();
-      resolve({ ok, latencyMs: ok ? Date.now() - start : null });
+      resolve({ ok, latencyMs: ok ? Date.now() - start : null, detail });
     };
     socket.setTimeout(timeoutMs);
     socket.once("connect", () => finish(true));
-    socket.once("timeout", () => finish(false));
-    socket.once("error", () => finish(false));
+    socket.once("timeout", () => finish(false, "timeout"));
+    socket.once("error", (e) => finish(false, e.code || e.message));
     socket.connect(Number(port) || DEFAULT_PRINT_PORT, host);
   });
 
 /// Pengecekan status gabungan: online kalau ICMP balas ATAU port cetak
 /// bisa di-connect. `via` menandai metode yang berhasil.
 const probe = async (host, port) => {
-  const [icmp, tcp] = await Promise.all([icmpPing(host), tcpProbe(host, port)]);
+  const p = Number(port) || DEFAULT_PRINT_PORT;
+  const [icmp, tcp] = await Promise.all([icmpPing(host), tcpProbe(host, p)]);
   const online = icmp.ok || tcp.ok;
+  const via = icmp.ok ? "icmp" : tcp.ok ? "tcp" : null;
+
+  if (STATUS_DEBUG || !online) {
+    slog(
+      `${host}: icmp=${icmp.ok ? `ok ${icmp.latencyMs}ms` : `FAIL(${icmp.detail})`}` +
+        ` tcp:${p}=${tcp.ok ? `ok ${tcp.latencyMs}ms` : `FAIL(${tcp.detail})`}` +
+        ` => online=${online}${via ? ` via ${via}` : ""}`,
+    );
+  }
+
   return {
     online,
     latencyMs: icmp.ok ? icmp.latencyMs : tcp.ok ? tcp.latencyMs : null,
-    via: icmp.ok ? "icmp" : tcp.ok ? "tcp" : null,
+    via,
   };
 };
 
@@ -396,7 +420,65 @@ class PrinterService {
       if (!alive.has(key)) statusCache.delete(key);
     }
 
+    const up = printers.filter((p) => p.online === true).length;
+    slog(
+      `poll selesai: ${up}/${printers.length} online` +
+        (printers.length
+          ? ` [${printers.map((p) => `${p.ipAddress}:${p.online}`).join(", ")}]`
+          : ""),
+    );
+
     return { checkedAt, printers };
+  }
+
+  /// Relay job cetak: terima payload TSPL mentah dari tablet, teruskan ke
+  /// printer jaringan lewat TCP (port cetak). Hanya untuk IP yang sudah
+  /// terdaftar sebagai printer NETWORK. Return { bytesSent, latencyMs }.
+  async relayPrint(ip, buffer) {
+    const device = await Device.findOne({
+      "network.ipAddress": ip,
+      deviceType: "PRINTER",
+      connectionType: "NETWORK",
+    });
+    if (!device) {
+      throw new Error("Printer not found");
+    }
+    const port = device.network?.port || DEFAULT_PRINT_PORT;
+    const key = String(device._id);
+
+    const latencyMs = await new Promise((resolve, reject) => {
+      const start = Date.now();
+      const socket = new net.Socket();
+      let settled = false;
+      const done = (fn, arg) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        fn(arg);
+      };
+      socket.setTimeout(RELAY_TIMEOUT_MS);
+      socket.once("timeout", () => done(reject, new Error("relay-timeout")));
+      socket.once("error", (e) => {
+        e.code = e.code || e.message;
+        done(reject, e);
+      });
+      socket.once("close", () => done(resolve, Date.now() - start));
+      socket.connect(port, ip, () => {
+        socket.write(buffer, () => socket.end());
+      });
+    });
+
+    // Cetak berhasil = bukti printer online.
+    statusCache.set(key, {
+      online: true,
+      latencyMs,
+      via: "relay",
+      checkedAt: new Date(),
+      failCount: 0,
+    });
+    rlog(`${ip}:${port} ok — ${buffer.length} bytes, ${latencyMs}ms`);
+
+    return { bytesSent: buffer.length, latencyMs };
   }
 
   /// Refresh cache tanpa menunggu (fire-and-forget) — dipanggil setelah
@@ -409,6 +491,9 @@ class PrinterService {
 
   /// Mulai poller latar belakang. Dipanggil sekali saat server boot.
   startStatusMonitor() {
+    slog(
+      `monitor start — platform=${process.platform}, interval=${STATUS_POLL_INTERVAL_MS}ms, debug=${STATUS_DEBUG}`,
+    );
     this.pingAllNetwork().catch((e) =>
       console.error("Initial printer status poll failed:", e.message),
     );

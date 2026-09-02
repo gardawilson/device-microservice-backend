@@ -15,6 +15,7 @@ import {
   pingPrinter,
   pingNetworkAdhoc,
   pingAllNetworkPrinters,
+  relayPrintJob,
 } from "../controllers/printerController.js";
 
 const router = express.Router();
@@ -300,6 +301,15 @@ router.put("/settings/max-print-count", setMaxPrintCount);
 // GET  /api/devices/printers/:id/ping        → cek satu printer terdaftar
 router.get("/network/status", pingAllNetworkPrinters);
 router.post("/ping", pingNetworkAdhoc);
+
+// Relay cetak: tablet POST payload TSPL mentah, service teruskan ke printer:port.
+// express.raw route-level → req.body = Buffer (express.json global no-op untuk
+// content-type non-JSON).
+router.post(
+  "/relay",
+  express.raw({ type: "*/*", limit: "16mb" }),
+  relayPrintJob,
+);
 
 // Keep param route at the end so it does not shadow static routes like /log
 router.get("/:id", getPrinterById);
